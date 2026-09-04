@@ -83,3 +83,25 @@ kill -HUP <pid>
 # Benchmark
 ./bench/bench_proxy.sh
 ```
+
+<!-- BEGIN cc:que-se-valora -->
+¡Hola! ¡Qué bueno que estés trabajando en tu proyecto "Proxy Epoll Kqueue"! Sé que es un reto, pero estoy aquí para ayudarte a entender qué es lo que buscamos cuando lo revisamos. Para que te quede claro, he preparado esta sección para el `README` de tu proyecto:
+
+---
+
+## 📋 Qué se valora
+
+Cuando revisemos tu proyecto, nos fijaremos en varias cosas para entender qué tan bien lo has resuelto.
+
+Primero, **lo que más pesa** es que tu proxy funcione como se espera y cumpla con todo lo que pide el enunciado. Queremos ver que hace lo que tiene que hacer, sin fallos y de forma robusta.
+
+También le damos un **peso importante** a la calidad de tu código y a la arquitectura que has elegido. Nos interesa que tu código sea claro, fácil de entender y que la estructura general de tu proyecto tenga sentido y esté bien pensada.
+
+El **vídeo demo** también tiene un **peso importante**. Es tu oportunidad para mostrarnos cómo funciona tu proxy en acción y explicarnos de forma concisa lo que has hecho.
+
+Finalmente, aunque con un **peso menor**, valoramos la documentación que incluyas y las decisiones que hayas tomado. Nos ayuda a entender tu proceso de pensamiento y por qué hiciste las cosas de cierta manera.
+
+Recuerda que el detalle del enunciado es lo que manda para saber qué se espera de tu proyecto, y la evaluación no penaliza por lo que el enunciado no pide explícitamente.
+
+---
+<!-- END cc:que-se-valora -->
