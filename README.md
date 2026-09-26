@@ -157,6 +157,10 @@ La referencia comentada de todas las opciones está en [`proxy.toml`](proxy.toml
 - **macOS/BSD (kqueue)**: `io_event_kqueue.c` y `watch_kqueue.c` están implementados, pero en este entorno solo se ha comprobado su sintaxis. No se han compilado ni ejecutado en un Mac: hay que pasar los tests allí antes de darlos por buenos.
 - **Windows/IOCP**: fuera de alcance.
 
+## 📄 Licencia
+
+[MIT](LICENSE). Incluye [tomlc99](https://github.com/cktan/tomlc99) (MIT) en `subprojects/tomlc99/`.
+
 <!-- BEGIN cc:que-se-valora -->
 ¡Hola! ¡Qué bueno que estés trabajando en tu proyecto "Proxy Epoll Kqueue"! Sé que es un reto, pero estoy aquí para ayudarte a entender qué es lo que buscamos cuando lo revisamos. Para que te quede claro, he preparado esta sección para el `README` de tu proyecto:
 
