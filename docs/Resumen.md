@@ -71,9 +71,23 @@ La dependencia tomlc99 (MIT) está vendorizada como subproject de Meson.
 - El push y el MR fallaron por falta de credenciales (token de `glab` caducado, claves SSH no dadas de alta). Se resolvió con `glab auth login`.
 - Para generar los PDF no había pandoc ni LaTeX. Se usó Chromium headless de Playwright, con sus librerías de sistema extraídas de paquetes `.deb` sin instalarlos.
 
+## Coste
+
+Tokens exactos sumados del transcript de la sesión (175 respuestas de `claude-opus-5-5`), valorados a precios de la API de Claude Opus 5.5:
+
+| Concepto | Tokens | Precio / M | USD |
+|---|---|---|---|
+| Lectura de caché | 57.178.538 | $0,20 | $11,44 |
+| Salida | 375.979 | $20,00 | $7,52 |
+| Escritura de caché (TTL 1 h) | 464.065 | $8,00 | $3,71 |
+| Entrada sin caché | 350 | $4,00 | $0,00 |
+| **Total** | | | **≈ $22,67** |
+
+El 99 % de la entrada se leyó de caché. Con plan Claude Max no se factura por token: la cifra es la referencia a precios de API. Está medida hasta la actualización de la presentación, así que no incluye los últimos mensajes de la sesión.
+
 ## Pendiente
 
 - **Probar en macOS/BSD**: el código kqueue solo tiene comprobada la sintaxis.
 - Revisar y fusionar el MR !1.
 - Vídeo demo (lo pide la rúbrica).
-- Coste de la sesión: lo aporta el usuario (`/cost`) para la presentación.
+

@@ -1,6 +1,8 @@
 // Genera docs/presentacion/proxy-l7.pptx
 //   npm i pptxgenjs@3 && node docs/presentacion/generar.mjs
-// Las cifras del coste se rellenan en COSTE (salida de /cost de Claude Code).
+// Coste: tokens exactos sumados del transcript de la sesión de Claude Code
+// (~/.claude/projects/<proyecto>/<sesión>.jsonl, campo usage de cada respuesta,
+// deduplicado por id de mensaje) y valorados a precios de la API de Opus 5.5.
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,12 +13,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 // ---- datos -----------------------------------------------------------
 const COSTE = {
-  // null = pendiente de la salida de /cost
-  usd: process.env.COSTE_USD || null,
-  tokens_in: process.env.COSTE_TOKENS_IN || null,
-  tokens_out: process.env.COSTE_TOKENS_OUT || null,
-  duracion_api: process.env.COSTE_DURACION_API || null,
+  // Sesión 6d064b05, 18:43-20:52 (UTC-3), 175 respuestas de claude-opus-5-5
+  tokens: { entrada: 350, salida: 375979, cache_escritura_1h: 464065, cache_lectura: 57178538 },
+  // USD por millón de tokens (Claude Opus 5.5, API first-party)
+  precio: { entrada: 4, salida: 20, cache_escritura_1h: 8, cache_lectura: 0.2 },
+  duracion: '2 h 09 min',
 };
+const usd = (k) => (COSTE.tokens[k] * COSTE.precio[k]) / 1e6;
+const COSTE_TOTAL = Object.keys(COSTE.tokens).reduce((a, k) => a + usd(k), 0);
+const money = (v) => '$' + v.toFixed(2).replace('.', ',');
+const mill = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1).replace('.', ',') + ' M' : Math.round(n / 1e3) + ' k');
 const BENCH = [
   { esc: 'HTTPS c100', rps: 223705, p99: '1,29 ms' },
   { esc: 'HTTPS c200', rps: 213565, p99: '2,37 ms' },
@@ -230,22 +236,30 @@ const fmt = (n) => n.toLocaleString('es-ES');
 // ---- 9. coste --------------------------------------------------------
 {
   const s = titled('Coste de generarlo', 'Claude Code · Claude Opus 5.5');
-  const pending = 'pendiente de /cost';
-  const has = COSTE.usd !== null;
-  kpi(s, 0.6, 1.75, 2.85, has ? COSTE.usd : '—', has ? 'coste total (USD)' : 'coste USD · ' + pending, has ? C.accent : C.warn);
-  kpi(s, 3.65, 1.75, 2.85, COSTE.tokens_in || '—', COSTE.tokens_in ? 'tokens de entrada' : 'tokens de entrada · ' + pending, COSTE.tokens_in ? C.accent : C.warn);
-  kpi(s, 6.7, 1.75, 2.85, COSTE.tokens_out || '—', COSTE.tokens_out ? 'tokens de salida' : 'tokens de salida · ' + pending, COSTE.tokens_out ? C.accent : C.warn);
-  kpi(s, 9.75, 1.75, 2.95, COSTE.duracion_api || '—', COSTE.duracion_api ? 'tiempo de API' : 'tiempo de API · ' + pending, COSTE.duracion_api ? C.accent : C.warn);
-  s.addText('Esfuerzo medido en la sesión', { x: 0.6, y: 3.4, w: 12, h: 0.45, fontFace: FONT, fontSize: 18, bold: true, color: C.ink });
-  const rows = [
-    ['Tiempo total de la sesión (spec → MR → documentación)', '≈ 1 h 50 min'],
-    ['Preguntas de aclaración al usuario', '12 en 3 rondas'],
-    ['Código C y scripts generados', '≈ 9.300 líneas · 38 ficheros en src/'],
-    ['Documentación', 'SPEC, requerimientos, decisiones, verificación, 2 PDF, esta presentación'],
-    ['Iteraciones de prueba hasta el verde', '1.ª ejecución 86/93 → 96/96; 3 bugs reales corregidos'],
-    ['Intervención humana', 'instalar dependencias (sudo) y autenticarse en GitLab'],
-  ].map(([a, b]) => [{ text: a }, { text: b, options: { bold: true } }]);
-  s.addTable(rows, { x: 0.6, y: 3.9, w: 12.1, colW: [6.2, 5.9], fontFace: FONT, fontSize: 13.5, color: C.ink, border: { type: 'solid', color: C.rule, pt: 0.75 }, rowH: 0.43 });
+  const totalIn = COSTE.tokens.entrada + COSTE.tokens.cache_escritura_1h + COSTE.tokens.cache_lectura;
+  kpi(s, 0.6, 1.75, 2.85, '≈ ' + money(COSTE_TOTAL), 'USD, equivalente a precios de API');
+  kpi(s, 3.65, 1.75, 2.85, mill(totalIn), 'tokens de entrada (' + Math.round((100 * COSTE.tokens.cache_lectura) / totalIn) + ' % desde caché)');
+  kpi(s, 6.7, 1.75, 2.85, mill(COSTE.tokens.salida), 'tokens de salida (código, docs y razonamiento)');
+  kpi(s, 9.75, 1.75, 2.95, COSTE.duracion, 'de sesión, de la spec al GitHub público');
+
+  const hdr = (t, right) => ({ text: t, options: { bold: true, fill: { color: C.soft }, align: right ? 'right' : 'left' } });
+  const r = (label, k) => [label, { text: mill(COSTE.tokens[k]), options: { align: 'right' } }, { text: money(COSTE.precio[k]) + '/M', options: { align: 'right', color: C.muted } }, { text: money(usd(k)), options: { align: 'right', bold: true } }];
+  s.addTable([
+    [hdr('Concepto'), hdr('Tokens', 1), hdr('Precio', 1), hdr('USD', 1)],
+    r('Lectura de caché (contexto reutilizado)', 'cache_lectura'),
+    r('Salida generada', 'salida'),
+    r('Escritura de caché (TTL 1 h)', 'cache_escritura_1h'),
+    [{ text: 'Total', options: { bold: true } }, '', '', { text: money(COSTE_TOTAL), options: { align: 'right', bold: true, color: C.accent } }],
+  ], { x: 0.6, y: 3.45, w: 7.4, colW: [3.5, 1.2, 1.2, 1.5], fontFace: FONT, fontSize: 13, color: C.ink, border: { type: 'solid', color: C.rule, pt: 0.75 }, rowH: 0.42 });
+
+  s.addText([
+    { text: 'Qué se obtuvo por ese coste', options: { bold: true, breakLine: true } },
+    { text: '≈ 9.300 líneas de C y scripts, 127 pruebas, benchmark, 2 PDF, esta presentación, MR y repo publicado.', options: { breakLine: true } },
+    { text: ' ', options: { fontSize: 6, breakLine: true } },
+    { text: 'Intervención humana: 12 respuestas de diseño, instalar dependencias (sudo) y autenticarse en GitLab/GitHub.', options: { color: C.muted, fontSize: 12, breakLine: true } },
+    { text: ' ', options: { fontSize: 6, breakLine: true } },
+    { text: 'Con plan Claude Max no se factura por token: la cifra es la referencia a precios de API.', options: { color: C.warn, fontSize: 12, italic: true } },
+  ], { x: 8.3, y: 3.45, w: 4.45, h: 3.3, fontFace: FONT, fontSize: 14, color: C.ink, valign: 'top' });
 }
 
 // ---- 10. estado ------------------------------------------------------
