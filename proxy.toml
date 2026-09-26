@@ -1,0 +1,80 @@
+# Configuración de referencia del proxy (SPEC.md §4).
+#
+# Para una configuración ejecutable con certificados de prueba:
+#   tests/gen_config.sh demo && ./build/src/proxy -c demo/proxy.toml
+#
+# Validar sin arrancar:   ./build/src/proxy -t -c proxy.toml
+# Recargar:               guardar el fichero, o kill -HUP <pid del master>
+# Rutas relativas (certificados, log) se resuelven respecto a este fichero.
+
+[global]
+workers      = "auto"           # "auto" = nº de CPUs, o un entero (1-128)
+stats_socket = "/tmp/proxy.sock" # nc -U /tmp/proxy.sock  -> JSON
+log_file     = "proxy.log"      # "-" = stderr
+log_level    = "info"           # debug | info | warn | error
+access_log   = true
+
+[timeouts]                      # milisegundos
+client_header    = 10000        # cabecera incompleta -> 408
+client_idle      = 60000        # keep-alive ocioso (cliente) y túnel WebSocket
+upstream_connect = 2000         # -> otro servidor, o 502/504
+upstream_read    = 30000        # sin datos del backend -> 504
+upstream_idle    = 30000        # conexión ociosa en el pool
+
+[[frontend]]
+name   = "web"
+listen = "0.0.0.0:8080"
+
+  [[frontend.route]]
+  host    = "api.test"          # dominio exacto
+  backend = "api"
+
+  [[frontend.route]]
+  host    = "*.example.com"     # wildcard: gana el sufijo más largo
+  backend = "web"
+
+  [[frontend.route]]
+  host    = "default"           # sin coincidencia -> default; sin default -> 404
+  backend = "web"
+
+[[frontend]]
+name   = "web-tls"
+listen = "0.0.0.0:8443"
+tls    = true
+certs  = [
+  { sni = "*.example.com", cert = "certs/wild-example.crt", key = "certs/wild-example.key" },
+  { sni = "api.test",      cert = "certs/api.crt",          key = "certs/api.key" },
+]
+default_cert = 0                # índice usado si el SNI no casa
+
+  [[frontend.route]]
+  host    = "api.test"
+  backend = "api"
+
+  [[frontend.route]]
+  host    = "*.example.com"
+  backend = "web"
+
+[[backend]]
+name     = "api"
+strategy = "least_load"         # round_robin | weighted | least_conn | least_load
+max_idle = 64                   # conexiones keep-alive ociosas por servidor
+servers  = [
+  { addr = "127.0.0.1:9001", weight = 1 },
+  { addr = "127.0.0.1:9002", weight = 1 },
+]
+  [backend.health]
+  type     = "http"             # tcp | http | none (solo pasivo)
+  path     = "/health"
+  interval = 2000
+  timeout  = 500
+  rise     = 2                  # OK consecutivos para volver a "up"
+  fall     = 3                  # fallos consecutivos para pasar a "down"
+
+[[backend]]
+name     = "web"
+strategy = "weighted"
+servers  = [
+  { addr = "127.0.0.1:9003", weight = 3 },
+  { addr = "127.0.0.1:9004", weight = 1 },
+]
