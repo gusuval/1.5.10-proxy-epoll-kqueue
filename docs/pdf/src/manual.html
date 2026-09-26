@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Proxy L7 — Manual de usuario</title>
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+
+<section class="cover">
+  <div class="band">
+    <div class="kicker">Manual de usuario</div>
+    <h1>Proxy inverso L7<br>Instalación, configuración y operación</h1>
+    <div class="sub">Guía práctica para compilar, configurar, poner en marcha, supervisar y diagnosticar el proxy.</div>
+  </div>
+  <div class="meta">
+    <b>Versión</b><span>1.0.0</span>
+    <b>Fecha</b><span>26 de septiembre de 2026</span>
+    <b>Binario</b><span><code>build/src/proxy</code></span>
+    <b>Referencia</b><span><code>proxy.toml</code> (comentado) · <code>SPEC.md</code></span>
+  </div>
+</section>
+
+<section class="toc">
+  <h2 class="nonum">Índice</h2>
+  <ol>
+    <li>Qué es y qué hace</li>
+    <li>Instalación</li>
+    <li>Primeros pasos (demo en 5 minutos)</li>
+    <li>Línea de comandos y señales</li>
+    <li>Referencia de configuración<ol><li>[global]</li><li>[timeouts]</li><li>[[frontend]] y rutas</li><li>[[backend]] y health</li></ol></li>
+    <li>Enrutamiento por dominio</li>
+    <li>HTTPS y certificados</li>
+    <li>Balanceo de carga</li>
+    <li>Health checks</li>
+    <li>Recarga en caliente</li>
+    <li>Supervisión: estadísticas y logs</li>
+    <li>Resolución de problemas</li>
+    <li>Herramientas de prueba y benchmark</li>
+  </ol>
+</section>
+
+<!-- ============================================================ -->
+<h2>Qué es y qué hace</h2>
+<p>El proxy se sitúa delante de tus servidores web. Escucha en uno o varios puertos (HTTP o HTTPS), mira el dominio que pide cada cliente y reenvía la petición a uno de los servidores del grupo configurado para ese dominio.</p>
+<ul>
+  <li><strong>Varios puertos de entrada</strong> (frontends), cada uno con sus propias reglas.</li>
+  <li><strong>Enrutamiento por dominio</strong>: exacto (<code>api.test</code>), comodín (<code>*.example.com</code>) y ruta por defecto.</li>
+  <li><strong>HTTPS</strong> con varios certificados por puerto, elegidos por el nombre que pide el cliente (SNI).</li>
+  <li><strong>Balanceo</strong>: round robin, por pesos, por menos conexiones o según la carga que informa cada servidor.</li>
+  <li><strong>Tolerancia a fallos</strong>: detecta servidores caídos y los saca del reparto.</li>
+  <li><strong>Recarga sin cortes</strong>: basta con guardar el fichero de configuración.</li>
+  <li>HTTP/1.1 completo: conexiones persistentes, pipelining, subidas grandes y WebSocket.</li>
+</ul>
+<div class="note"><p>Plataformas: <strong>Linux</strong> (verificado). macOS y BSD están soportados en el código, pero aún no se han probado en esas plataformas. Windows no está soportado.</p></div>
+
+<!-- ============================================================ -->
+<h2>Instalación</h2>
+<h3>Requisitos</h3>
+<table>
+  <tr><th>Para</th><th>Necesitas</th></tr>
+  <tr><td>Compilar</td><td>Compilador C11 (gcc o clang), Meson ≥ 0.60, Ninja, pkg-config, OpenSSL ≥ 3.0 (cabeceras)</td></tr>
+  <tr><td>Tests unitarios</td><td>cmocka</td></tr>
+  <tr><td>Tests de integración</td><td>curl, jq, socat, openssl</td></tr>
+  <tr><td>Benchmark</td><td>wrk</td></tr>
+</table>
+<p>En Ubuntu/Debian:</p>
+<pre><code>sudo apt-get install build-essential meson ninja-build pkg-config libssl-dev \
+                     libcmocka-dev curl jq socat wrk</code></pre>
+<p>En macOS (Homebrew): <code>brew install meson ninja pkg-config openssl@3 cmocka wrk jq socat</code>.</p>
+
+<h3>Compilar</h3>
+<pre><code>meson setup build
+meson compile -C build
+meson test -C build --suite unit     <span class="c"># opcional: 5 suites de tests</span></code></pre>
+<p>Se generan tres programas: <code>build/src/proxy</code> (el proxy), <code>build/tools/test_backend</code> (servidor de pruebas) y <code>build/tools/ws_probe</code> (cliente WebSocket de pruebas). Para producción, compila en modo release:</p>
+<pre><code>meson setup build-release -Dbuildtype=release -Db_lto=true
+meson compile -C build-release
+sudo meson install -C build-release   <span class="c"># instala 'proxy' en /usr/local/bin</span></code></pre>
+
+<!-- ============================================================ -->
+<h2>Primeros pasos (demo en 5 minutos)</h2>
+<p>El proyecto trae un generador de configuración de prueba con su propia autoridad certificadora.</p>
+<pre><code><span class="c"># 1. Configuración + certificados de prueba en ./demo</span>
+./tests/gen_config.sh demo
+
+<span class="c"># 2. Unos servidores de ejemplo</span>
+./build/tools/test_backend --port 19001 --name api-1 &amp;
+./build/tools/test_backend --port 19002 --name api-2 &amp;
+./build/tools/test_backend --port 19004 --name web-1 &amp;
+
+<span class="c"># 3. El proxy</span>
+./build/src/proxy -c demo/proxy.toml</code></pre>
+<p>En otra terminal:</p>
+<pre><code>curl -H 'Host: api.test' http://127.0.0.1:18080/
+<span class="c">hello from api-1 path=/                  (+ una línea de relleno hasta 100 B)</span>
+curl -H 'Host: api.test' http://127.0.0.1:18080/
+<span class="c">hello from api-2 path=/                  (round robin)</span>
+curl -H 'Host: www.example.com' http://127.0.0.1:18080/
+<span class="c">hello from web-1 path=/                  (comodín *.example.com)</span>
+
+<span class="c"># HTTPS, verificando el certificado con la CA de la demo</span>
+curl --cacert demo/certs/ca.pem --resolve api.test:18443:127.0.0.1 https://api.test:18443/</code></pre>
+<div class="note"><p><strong>Sin tocar /etc/hosts.</strong> <code>curl --resolve</code> o <code>-H 'Host: …'</code> bastan para probar dominios. Si quieres usar los nombres en el navegador: <code>sudo ./tests/hosts.sh add</code> (se deshace con <code>remove</code>).</p></div>
+<p>Para parar: <kbd>Ctrl</kbd>+<kbd>C</kbd> en la terminal del proxy. Hace una parada ordenada.</p>
+
+<!-- ============================================================ -->
+<h2>Línea de comandos y señales</h2>
+<pre><code>proxy -c &lt;config.toml&gt; [-t] [-w N]
+  -c  fichero de configuración TOML (obligatorio)
+  -t  solo valida la configuración y sale
+  -w  fuerza el número de workers</code></pre>
+<p>Valida siempre antes de desplegar:</p>
+<pre><code>$ ./build/src/proxy -t -c demo/proxy.toml
+configuración OK: 3 frontends, 8 backends, 2 workers</code></pre>
+<p>El proxy arranca un proceso <strong>master</strong> y N procesos <strong>worker</strong>. Las señales van siempre al master:</p>
+<table>
+  <tr><th>Señal</th><th>Efecto</th></tr>
+  <tr><td><code>SIGHUP</code></td><td>Recarga la configuración (también se recarga sola al guardar el fichero)</td></tr>
+  <tr><td><code>SIGTERM</code>, <code>SIGINT</code></td><td>Parada ordenada: deja de aceptar conexiones y espera hasta 10 s a las peticiones en curso</td></tr>
+</table>
+<pre><code>kill -HUP $(pgrep -o -f 'proxy -c')      <span class="c"># -o: el más antiguo = master</span></code></pre>
+<p>Si un worker muere, el master lo relanza automáticamente.</p>
+
+<!-- ============================================================ -->
+<h2>Referencia de configuración</h2>
+<p>La configuración es un fichero <strong>TOML</strong>. Las rutas relativas (certificados, log) se resuelven respecto al propio fichero. Una clave desconocida o mal escrita es un error: el proxy no arranca, o en una recarga la descarta y mantiene la configuración anterior.</p>
+
+<h3>[global]</h3>
+<table>
+  <tr><th>Clave</th><th>Tipo</th><th>Por defecto</th><th>Descripción</th></tr>
+  <tr><td><code>workers</code></td><td>"auto" o 1-128</td><td>"auto"</td><td>Procesos worker; "auto" = nº de CPUs. Cambiarlo requiere reiniciar</td></tr>
+  <tr><td><code>stats_socket</code></td><td>ruta</td><td>/tmp/proxy.sock</td><td>Socket UNIX de estadísticas (máx. 107 caracteres)</td></tr>
+  <tr><td><code>log_file</code></td><td>ruta</td><td>stderr</td><td>Fichero de log; "-" = stderr</td></tr>
+  <tr><td><code>log_level</code></td><td>texto</td><td>"info"</td><td>debug · info · warn · error</td></tr>
+  <tr><td><code>access_log</code></td><td>booleano</td><td>true</td><td>Una línea por petición</td></tr>
+</table>
+
+<h3>[timeouts]</h3>
+<p>Todos en milisegundos.</p>
+<table>
+  <tr><th>Clave</th><th class="n">Por defecto</th><th>Qué controla</th><th>Al vencer</th></tr>
+  <tr><td><code>client_header</code></td><td class="n">10000</td><td>Tiempo máximo para recibir la cabecera (y el handshake TLS)</td><td>408</td></tr>
+  <tr><td><code>client_idle</code></td><td class="n">60000</td><td>Conexión persistente ociosa y túnel WebSocket sin tráfico</td><td>cierre</td></tr>
+  <tr><td><code>upstream_connect</code></td><td class="n">2000</td><td>Conexión a un servidor backend</td><td>otro servidor, o 504</td></tr>
+  <tr><td><code>upstream_read</code></td><td class="n">30000</td><td>Tiempo sin recibir datos del backend</td><td>504</td></tr>
+  <tr><td><code>upstream_idle</code></td><td class="n">30000</td><td>Conexión reutilizable ociosa hacia el backend</td><td>cierre</td></tr>
+</table>
+
+<h3>[[frontend]] y rutas</h3>
+<p>Cada <code>[[frontend]]</code> es un puerto de entrada. Sus rutas se declaran justo debajo con <code>[[frontend.route]]</code>.</p>
+<table>
+  <tr><th>Clave</th><th>Descripción</th></tr>
+  <tr><td><code>name</code></td><td>Nombre único (aparece en los logs)</td></tr>
+  <tr><td><code>listen</code></td><td><code>"ip:puerto"</code>, <code>"[::]:puerto"</code> o <code>"*:puerto"</code></td></tr>
+  <tr><td><code>tls</code></td><td><code>true</code> para HTTPS (requiere <code>certs</code>)</td></tr>
+  <tr><td><code>certs</code></td><td>Lista de <code>{ sni, cert, key }</code> (ver capítulo 7)</td></tr>
+  <tr><td><code>default_cert</code></td><td>Índice del certificado para clientes sin SNI o con SNI desconocido (0 por defecto)</td></tr>
+  <tr><td><code>route.host</code></td><td><code>"dominio"</code>, <code>"*.dominio"</code> o <code>"default"</code></td></tr>
+  <tr><td><code>route.backend</code></td><td>Nombre de un <code>[[backend]]</code></td></tr>
+</table>
+<pre><code>[[frontend]]
+name   = "web"
+listen = "0.0.0.0:8080"
+
+  [[frontend.route]]
+  host    = "api.test"
+  backend = "api"
+
+  [[frontend.route]]
+  host    = "default"
+  backend = "web"</code></pre>
+
+<h3>[[backend]] y health</h3>
+<table>
+  <tr><th>Clave</th><th>Por defecto</th><th>Descripción</th></tr>
+  <tr><td><code>name</code></td><td>—</td><td>Nombre único, referenciado desde las rutas</td></tr>
+  <tr><td><code>strategy</code></td><td>round_robin</td><td>round_robin · weighted · least_conn · least_load</td></tr>
+  <tr><td><code>max_idle</code></td><td>64</td><td>Conexiones persistentes ociosas que se guardan por servidor</td></tr>
+  <tr><td><code>servers</code></td><td>—</td><td>Lista de <code>{ addr = "host:puerto", weight = 1 }</code> (1-64 servidores; peso 1-1000)</td></tr>
+  <tr><td><code>health.type</code></td><td>sin sección: none</td><td>tcp · http · none</td></tr>
+  <tr><td><code>health.path</code></td><td>/health</td><td>Ruta consultada con <code>type = "http"</code> (espera 2xx)</td></tr>
+  <tr><td><code>health.interval</code></td><td>2000</td><td>ms entre sondas</td></tr>
+  <tr><td><code>health.timeout</code></td><td>500</td><td>ms máximos por sonda</td></tr>
+  <tr><td><code>health.rise</code> / <code>fall</code></td><td>2 / 3</td><td>Éxitos para volver a "up" / fallos para pasar a "down"</td></tr>
+</table>
+<pre><code>[[backend]]
+name     = "api"
+strategy = "least_load"
+servers  = [ { addr = "10.0.0.11:9000" }, { addr = "10.0.0.12:9000" } ]
+  [backend.health]
+  type = "http"
+  path = "/health"</code></pre>
+
+<!-- ============================================================ -->
+<h2>Enrutamiento por dominio</h2>
+<p>Para cada petición se toma el dominio de la cabecera <code>Host</code> (sin puerto, sin distinguir mayúsculas) y se busca en las rutas del frontend por el que entró, en este orden:</p>
+<ol>
+  <li><strong>Dominio exacto</strong>: <code>api.test</code>.</li>
+  <li><strong>Comodín</strong>: <code>*.example.com</code> cubre <code>a.example.com</code> y <code>a.b.example.com</code>, pero no <code>example.com</code>. Si varios encajan, gana el más específico (<code>*.eu.example.com</code> antes que <code>*.example.com</code>).</li>
+  <li><strong>default</strong>, si existe.</li>
+  <li>Si nada encaja: <strong>404</strong>.</li>
+</ol>
+<table>
+  <tr><th>Host pedido</th><th>Rutas: api.test · *.example.com · default</th></tr>
+  <tr><td><code>api.test</code>, <code>API.TEST:8080</code></td><td>api.test</td></tr>
+  <tr><td><code>www.example.com</code></td><td>*.example.com</td></tr>
+  <tr><td><code>example.com</code>, <code>otro.test</code></td><td>default (sin default: 404)</td></tr>
+</table>
+<p>Cada petición de una conexión persistente se enruta por separado. El backend recibe además <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code> (<code>http</code>/<code>https</code>) y <code>X-Real-IP</code> con la IP del cliente.</p>
+
+<!-- ============================================================ -->
+<h2>HTTPS y certificados</h2>
+<p>Un frontend con <code>tls = true</code> termina HTTPS (TLS 1.2 y 1.3); hacia los backends el tráfico va en HTTP normal. Puedes poner varios certificados en el mismo puerto: se elige según el nombre (SNI) que envía el cliente.</p>
+<pre><code>[[frontend]]
+name   = "web-tls"
+listen = "0.0.0.0:443"
+tls    = true
+certs  = [
+  { sni = "api.test",      cert = "certs/api.crt",  key = "certs/api.key" },
+  { sni = "*.example.com", cert = "certs/wild.crt", key = "certs/wild.key" },
+]
+default_cert = 0</code></pre>
+<ul>
+  <li><code>cert</code>: certificado en PEM; puede incluir la cadena intermedia a continuación.</li>
+  <li><code>key</code>: clave privada en PEM, sin contraseña. Se comprueba que corresponde al certificado.</li>
+  <li>En <code>sni</code>, el comodín cubre una sola etiqueta (<code>*.example.com</code> no vale para <code>a.b.example.com</code>), igual que en los certificados reales.</li>
+</ul>
+<p>Si el cliente pide por SNI un nombre y luego envía un <code>Host</code> distinto que su certificado no cubre, recibe <strong>421 Misdirected Request</strong>.</p>
+<h4>Crear un certificado de prueba</h4>
+<pre><code>openssl req -x509 -newkey rsa:2048 -nodes -days 365 -sha256 \
+  -keyout certs/api.key -out certs/api.crt \
+  -subj "/CN=api.test" -addext "subjectAltName=DNS:api.test"</code></pre>
+<p>Comprobar qué certificado sirve el proxy:</p>
+<pre><code>openssl s_client -connect 127.0.0.1:443 -servername api.test &lt;/dev/null 2>/dev/null \
+  | openssl x509 -noout -subject</code></pre>
+
+<!-- ============================================================ -->
+<h2>Balanceo de carga</h2>
+<table>
+  <tr><th>Estrategia</th><th>Cómo reparte</th><th>Úsala cuando…</th></tr>
+  <tr><td><code>round_robin</code></td><td>Por turnos</td><td>Los servidores son iguales y las peticiones parecidas</td></tr>
+  <tr><td><code>weighted</code></td><td>Proporcional a <code>weight</code>, sin ráfagas</td><td>Hay máquinas de distinta capacidad</td></tr>
+  <tr><td><code>least_conn</code></td><td>Al que tiene menos peticiones en curso</td><td>Algunas peticiones son mucho más lentas que otras</td></tr>
+  <tr><td><code>least_load</code></td><td>Al que informa de menos carga</td><td>Los servidores pueden medir su propia carga</td></tr>
+</table>
+<h4>Cómo informa un servidor de su carga</h4>
+<p>Con <code>least_load</code>, cada servidor añade a sus respuestas la cabecera <code>X-Backend-Load</code> con un número de <strong>0.0</strong> (libre) a <strong>1.0</strong> (saturado). El proxy la lee, la suaviza para evitar saltos bruscos y <strong>la elimina</strong> antes de responder al cliente.</p>
+<pre><code>HTTP/1.1 200 OK
+Content-Type: application/json
+X-Backend-Load: 0.37</code></pre>
+<p>Si un servidor deja de enviarla durante más de 5 s, su carga se considera desconocida y se reparte por conexiones activas.</p>
+<div class="note"><p>El reparto es por worker: con 8 workers, cada uno aplica la estrategia a sus propias peticiones, y el efecto global es el mismo.</p></div>
+
+<!-- ============================================================ -->
+<h2>Health checks</h2>
+<ul>
+  <li><strong>Pasivos</strong> (siempre activos): si conectar a un servidor falla <code>fall</code> veces seguidas, deja de recibir tráfico. Sin sondas configuradas, se vuelve a probar pasado <code>interval</code>.</li>
+  <li><strong>Activos</strong> (sección <code>[backend.health]</code>): el proxy consulta cada servidor cada <code>interval</code> ms, por TCP o con <code>GET path</code> esperando 2xx. Tras <code>fall</code> fallos pasa a "down"; tras <code>rise</code> éxitos vuelve a "up".</li>
+</ul>
+<p>Cuando un servidor falla al conectar, la petición se reintenta en otro sin que el cliente lo note. Si no queda ninguno sano, el cliente recibe <strong>503</strong>. Los cambios de estado quedan en el log:</p>
+<pre><code>[warn] [w0] backend 'api' servidor 127.0.0.1:9002 -> DOWN (sonda http)
+[warn] [w0] backend 'api' servidor 127.0.0.1:9002 -> UP (sonda http)</code></pre>
+
+<!-- ============================================================ -->
+<h2>Recarga en caliente</h2>
+<p>Para cambiar la configuración, <strong>edita y guarda el fichero</strong>: el proxy lo detecta en menos de un segundo (funciona igual con editores que guardan por renombrado, como vim, o con <code>sed -i</code>). También puedes forzarla con <code>kill -HUP</code>.</p>
+<ul>
+  <li>La nueva configuración se valida entera antes de aplicarse. Si tiene un error, <strong>se descarta, se mantiene la actual</strong> y el motivo queda en el log.</li>
+  <li>Las peticiones en curso terminan con la configuración anterior; las nuevas usan la nueva. No se corta ninguna conexión.</li>
+  <li>Se pueden añadir o quitar frontends (puertos), rutas, backends, servidores y certificados.</li>
+  <li>Cambiar <code>workers</code> o <code>stats_socket</code> requiere reiniciar.</li>
+</ul>
+<pre><code>[info]  [master] configuración recargada (cambio en fichero)
+[error] [master] recarga rechazada, se mantiene la configuración actual:
+                 TOML inválido: line 133: syntax error</code></pre>
+
+<!-- ============================================================ -->
+<h2>Supervisión: estadísticas y logs</h2>
+<h3>Estadísticas</h3>
+<pre><code>socat - UNIX-CONNECT:/tmp/proxy.sock | jq .     <span class="c"># o: nc -U /tmp/proxy.sock</span></code></pre>
+<pre><code>{
+  "uptime_s": 1.6, "workers": 2, "workers_alive": 2, "worker_restarts": 0,
+  "reloads_ok": 0, "reloads_failed": 0,
+  "connections_accepted": 2, "connections_active": 0, "tls_handshakes": 0,
+  "requests_total": 10,
+  "responses": { "1xx": 0, "2xx": 9, "3xx": 0, "4xx": 1, "5xx": 0 },
+  "upstream": { "connects": 3, "reuses": 6, "retries": 0 },
+  "buffers_in_use": 0, "log_dropped": 0,
+  "backends": [
+    { "backend": "api", "server": "127.0.0.1:19001", "state": "up", "up_workers": 2,
+      "active": 0, "idle": 1, "load": 0.020, "requests": 3, "failures": 0 }
+  ]
+}</code></pre>
+<table>
+  <tr><th>Campo</th><th>Significado</th></tr>
+  <tr><td><code>upstream.reuses</code> / <code>connects</code></td><td>Peticiones servidas por conexiones reutilizadas / conexiones nuevas a backends. Un ratio alto es lo esperado</td></tr>
+  <tr><td><code>upstream.retries</code></td><td>Reintentos por conexiones persistentes que el backend había cerrado</td></tr>
+  <tr><td><code>backends[].state</code></td><td><code>up</code>, <code>down</code> o <code>degraded</code> (los workers no coinciden)</td></tr>
+  <tr><td><code>backends[].load</code></td><td>Carga media informada (<code>null</code> si no se conoce)</td></tr>
+  <tr><td><code>log_dropped</code></td><td>Mensajes de log descartados porque el disco no daba abasto</td></tr>
+</table>
+<h3>Logs</h3>
+<p>Formato: <code>fecha [nivel] [proceso] mensaje</code>. El proceso es <code>master</code> o <code>wN</code>. Cada petición genera una línea de acceso:</p>
+<pre><code>2026-09-26T23:12:47.184Z [access] [w0] 127.0.0.1 api.test "GET /hola" 200 127.0.0.1:19001 1ms
+                                        │         │         │           │   │               └ latencia
+                                        │         │         │           │   └ servidor que respondió
+                                        │         │         │           └ código HTTP
+                                        │         │         └ método y ruta
+                                        │         └ dominio (Host)
+                                        └ IP del cliente</code></pre>
+<p>Con mucho tráfico, desactiva el access log (<code>access_log = false</code>) o usa <code>log_level = "warn"</code>.</p>
+
+<!-- ============================================================ -->
+<h2>Resolución de problemas</h2>
+<table>
+  <tr><th>Síntoma</th><th>Causa probable</th><th>Qué hacer</th></tr>
+  <tr><td>No arranca: <code>clave desconocida 'x'</code></td><td>Errata en la configuración</td><td>Corrige el nombre; valida con <code>proxy -t -c …</code></td></tr>
+  <tr><td>No arranca: <code>bind …: Address already in use</code></td><td>Otro programa usa ese puerto</td><td><code>ss -ltnp | grep :8080</code></td></tr>
+  <tr><td>No arranca: <code>no se puede cargar el certificado</code></td><td>Ruta mal escrita (es relativa al .toml) o fichero ilegible</td><td>Revisa rutas y permisos</td></tr>
+  <tr><td><code>la clave no corresponde al certificado</code></td><td>Pareja cert/key equivocada</td><td>Revisa la pareja cert/key</td></tr>
+  <tr><td>Log: <code>stats_socket demasiado largo</code></td><td>Ruta del socket de más de 107 caracteres</td><td>Usa una ruta corta, p. ej. <code>/tmp/proxy.sock</code></td></tr>
+  <tr><td><strong>404</strong></td><td>Ninguna ruta para ese dominio</td><td>Añade la ruta o una <code>default</code>; revisa el <code>Host</code> que envía el cliente</td></tr>
+  <tr><td><strong>421</strong></td><td>SNI y Host no coinciden</td><td>Usa el mismo nombre en la URL y en <code>Host</code>, o un certificado que cubra ambos</td></tr>
+  <tr><td><strong>431</strong></td><td>Cabeceras de más de 16 KB (cookies enormes)</td><td>Reduce las cabeceras del cliente</td></tr>
+  <tr><td><strong>502</strong></td><td>No se pudo conectar a ningún servidor, o respondió mal</td><td>Comprueba que los backends escuchan en <code>addr</code>; mira <code>failures</code> en las estadísticas</td></tr>
+  <tr><td><strong>503</strong></td><td>Todos los servidores del backend están "down"</td><td>Revisa las sondas (<code>path</code>, puerto) y el log de cambios de estado</td></tr>
+  <tr><td><strong>504</strong></td><td>El backend tardó más que <code>upstream_read</code></td><td>Sube el timeout o investiga el backend</td></tr>
+  <tr><td><strong>408</strong></td><td>El cliente no terminó de enviar la cabecera a tiempo</td><td>Normal con clientes lentos o escáneres; ajusta <code>client_header</code></td></tr>
+  <tr><td>Un cambio de config no se aplica</td><td>La recarga se rechazó</td><td>Busca <code>recarga rechazada</code> en el log; <code>reloads_failed</code> en las estadísticas</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>Herramientas de prueba y benchmark</h2>
+<h3>Servidor de pruebas: test_backend</h3>
+<pre><code>test_backend --port N --name NOMBRE [--latency-ms N] [--load F | --load-auto]
+             [--threads N] [--bind IP] [--drop-every N]</code></pre>
+<table>
+  <tr><th>Ruta</th><th>Respuesta</th></tr>
+  <tr><td><code>/</code> (cualquier otra)</td><td><code>hello from NOMBRE path=…</code> más relleno hasta 100 B</td></tr>
+  <tr><td><code>/health</code></td><td>200 "ok"</td></tr>
+  <tr><td><code>/echo</code></td><td>Devuelve el cuerpo enviado (también chunked)</td></tr>
+  <tr><td><code>/headers</code></td><td>Devuelve las cabeceras recibidas; útil para ver <code>X-Forwarded-*</code></td></tr>
+  <tr><td><code>/sleep/MS</code>, <code>/big/N</code></td><td>Responde tras MS milisegundos / cuerpo de N bytes</td></tr>
+  <tr><td><code>/chunked</code>, <code>/close</code>, <code>/nocontent</code></td><td>Respuesta chunked / delimitada por cierre / 204</td></tr>
+  <tr><td><code>/ws</code></td><td>WebSocket de eco</td></tr>
+  <tr><td><code>/stats</code></td><td>JSON con las conexiones y peticiones recibidas</td></tr>
+</table>
+<p><code>--load 0.3</code> fija la cabecera <code>X-Backend-Load</code>; <code>--load-auto</code> la calcula según las conexiones activas.</p>
+<h3>Cliente WebSocket: ws_probe</h3>
+<pre><code>ws_probe --host api.test 127.0.0.1 18080 /ws "hola"
+ws_probe --tls --ca demo/certs/ca.pem --sni api.test 127.0.0.1 18443 /ws "hola"</code></pre>
+<h3>Tests automáticos</h3>
+<pre><code>meson test -C build --suite unit   <span class="c"># 31 tests unitarios</span>
+./tests/integration/run.sh         <span class="c"># 96 comprobaciones de extremo a extremo (~20 s)</span></code></pre>
+<p>El script de integración genera su propia configuración, lanza 12 servidores y el proxy, comprueba todas las funcionalidades y lo limpia todo al terminar. <code>PORT_BASE=N</code> cambia los puertos y <code>KEEP_WORK=1</code> conserva los ficheros para inspeccionarlos.</p>
+<h3>Benchmark</h3>
+<pre><code>./bench/bench_proxy.sh                           <span class="c"># 30 s por escenario</span>
+DURATION=10s WORKERS=4 ./bench/bench_proxy.sh    <span class="c"># variante rápida</span></code></pre>
+<p>El script compila en release, reparte CPUs entre wrk, el proxy y los backends, y deja un informe en <code>bench/results/</code>. Resultado de referencia (8 workers, WSL2, Ryzen 7 7735HS): <strong>223.705 req/s por HTTPS</strong> con 100 conexiones y 337.904 por HTTP, sin errores.</p>
+
+</body>
+</html>

@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Proxy L7 — Documentación técnica</title>
+<link rel="stylesheet" href="estilo.css">
+</head>
+<body>
+
+<section class="cover">
+  <div class="band">
+    <div class="kicker">Documentación técnica</div>
+    <h1>Proxy inverso L7 de alto rendimiento<br>C11 · epoll / kqueue</h1>
+    <div class="sub">Arquitectura, módulos, protocolos, decisiones de diseño, pruebas y rendimiento.</div>
+  </div>
+  <div class="meta">
+    <b>Versión</b><span>1.0.0 — rama <code>feat/proxy-l7</code> (MR !1)</span>
+    <b>Fecha</b><span>26 de septiembre de 2026</span>
+    <b>Plataformas</b><span>Linux (epoll) verificada · macOS/BSD (kqueue) implementada, sin ejecutar</span>
+    <b>Documentos</b><span>SPEC.md · docs/requerimientos.md · docs/decisiones.md · docs/verificacion.md</span>
+  </div>
+</section>
+
+<section class="toc">
+  <h2 class="nonum">Índice</h2>
+  <ol>
+    <li>Visión general<ol><li>Alcance</li><li>Cifras clave</li></ol></li>
+    <li>Arquitectura<ol><li>Procesos</li><li>Flujo de una petición</li><li>Estructura del código</li></ol></li>
+    <li>Event loop (<code>io_event</code>)<ol><li>API</li><li>Edge-triggered y <code>sess_drive</code></li><li>Timers y reloj</li><li>Liberación diferida</li></ol></li>
+    <li>Master y workers<ol><li>Canal master → worker</li><li>Sockets de escucha</li><li>Señales, relanzamiento y parada</li></ol></li>
+    <li>Ciclo de vida de una conexión<ol><li>Máquina de estados</li><li>Buffers y contrapresión</li><li>Timeouts</li></ol></li>
+    <li>HTTP/1.1<ol><li>Parser</li><li>Reescritura de cabeceras</li><li>Cuerpos</li><li>Keep-alive, pool y reintento</li><li>Pipelining y WebSocket</li><li>Errores generados por el proxy</li></ol></li>
+    <li>TLS y SNI</li>
+    <li>Enrutamiento, balanceo y salud</li>
+    <li>Configuración y recarga en caliente</li>
+    <li>Observabilidad</li>
+    <li>Pruebas y rendimiento</li>
+    <li>Decisiones de diseño y limitaciones</li>
+  </ol>
+</section>
+
+<!-- ============================================================ -->
+<h2>Visión general</h2>
+
+<p>El proyecto es un <strong>proxy inverso de capa 7</strong> escrito en C11 sin frameworks, directamente sobre las APIs del sistema operativo. Recibe conexiones HTTP y HTTPS en uno o varios puertos, decide el destino por el nombre de dominio (<code>Host:</code>) y reparte las peticiones entre varios servidores backend.</p>
+
+<h3>Alcance</h3>
+<table>
+  <tr><th>Incluido</th><th>Fuera de alcance</th></tr>
+  <tr><td>Linux (<code>epoll</code>) y macOS/BSD (<code>kqueue</code>)</td><td>Windows / IOCP</td></tr>
+  <tr><td>HTTP/1.0 y HTTP/1.1 en ambos lados</td><td>HTTP/2 y HTTP/3</td></tr>
+  <tr><td>Terminación TLS (OpenSSL ≥ 3.0) con SNI</td><td>TLS hacia los backends</td></tr>
+  <tr><td>Keep-alive, pipelining, chunked, WebSocket</td><td>Caché y compresión</td></tr>
+  <tr><td>Recarga automática y por SIGHUP</td><td>API de administración remota</td></tr>
+</table>
+
+<h3>Cifras clave</h3>
+<div class="kpis">
+  <div class="kpi"><div class="v">223.705</div><div class="l">req/s HTTPS (100 conexiones)</div></div>
+  <div class="kpi"><div class="v">337.904</div><div class="l">req/s HTTP (200 conexiones)</div></div>
+  <div class="kpi"><div class="v">0</div><div class="l">errores en 28,5 M peticiones</div></div>
+  <div class="kpi"><div class="v">96 + 31</div><div class="l">comprobaciones de integración + tests unitarios</div></div>
+</div>
+<p>La meta del enunciado (≥ 50.000 req/s sobre HTTPS) se supera entre 3,4× y 4,5× en todos los escenarios medidos (sección 11).</p>
+
+<!-- ============================================================ -->
+<h2>Arquitectura</h2>
+
+<h3>Procesos</h3>
+<figure>
+<svg viewBox="0 0 680 300" xmlns="http://www.w3.org/2000/svg" font-family="Ubuntu Sans, sans-serif" font-size="11">
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b6475"/></marker></defs>
+  <!-- clientes -->
+  <rect x="10" y="120" width="90" height="50" rx="6" fill="#fff" stroke="#5b6475"/>
+  <text x="55" y="142" text-anchor="middle" font-weight="600">Clientes</text>
+  <text x="55" y="158" text-anchor="middle" fill="#5b6475">HTTP / HTTPS</text>
+  <!-- master -->
+  <rect x="200" y="10" width="280" height="62" rx="6" fill="#e6f2f1" stroke="#0b6e69"/>
+  <text x="340" y="30" text-anchor="middle" font-weight="600">Master</text>
+  <text x="340" y="46" text-anchor="middle" fill="#1d2330">valida config · vigila el fichero · SIGHUP</text>
+  <text x="340" y="61" text-anchor="middle" fill="#1d2330">relanza workers · socket de estadísticas</text>
+  <!-- workers -->
+  <g>
+    <rect x="200" y="110" width="130" height="92" rx="6" fill="#fff" stroke="#0b6e69"/>
+    <text x="265" y="128" text-anchor="middle" font-weight="600">Worker 0</text>
+    <text x="265" y="145" text-anchor="middle">event loop (1 hilo)</text>
+    <text x="265" y="160" text-anchor="middle" fill="#5b6475">hilo de health</text>
+    <text x="265" y="175" text-anchor="middle" fill="#5b6475">hilo de log</text>
+    <text x="265" y="192" text-anchor="middle" fill="#5b6475">pool de buffers</text>
+  </g>
+  <g>
+    <rect x="350" y="110" width="130" height="92" rx="6" fill="#fff" stroke="#0b6e69"/>
+    <text x="415" y="128" text-anchor="middle" font-weight="600">Worker N-1</text>
+    <text x="415" y="145" text-anchor="middle">event loop (1 hilo)</text>
+    <text x="415" y="160" text-anchor="middle" fill="#5b6475">hilo de health</text>
+    <text x="415" y="175" text-anchor="middle" fill="#5b6475">hilo de log</text>
+    <text x="415" y="192" text-anchor="middle" fill="#5b6475">pool de buffers</text>
+  </g>
+  <text x="340" y="160" text-anchor="middle" fill="#5b6475">…</text>
+  <!-- shm -->
+  <rect x="200" y="235" width="280" height="40" rx="6" fill="#f4f6f9" stroke="#5b6475" stroke-dasharray="4 3"/>
+  <text x="340" y="252" text-anchor="middle" font-weight="600">Memoria compartida (mmap)</text>
+  <text x="340" y="267" text-anchor="middle" fill="#5b6475">contadores atómicos + tabla de servidores (seqlock)</text>
+  <!-- backends -->
+  <rect x="570" y="80" width="100" height="40" rx="6" fill="#fff" stroke="#5b6475"/>
+  <text x="620" y="104" text-anchor="middle">backend A</text>
+  <rect x="570" y="135" width="100" height="40" rx="6" fill="#fff" stroke="#5b6475"/>
+  <text x="620" y="159" text-anchor="middle">backend B</text>
+  <rect x="570" y="190" width="100" height="40" rx="6" fill="#fff" stroke="#5b6475"/>
+  <text x="620" y="214" text-anchor="middle">backend C</text>
+  <!-- flechas -->
+  <line x1="100" y1="145" x2="197" y2="150" stroke="#5b6475" marker-end="url(#a)"/>
+  <text x="148" y="136" text-anchor="middle" fill="#5b6475" font-size="9.5">SO_REUSEPORT</text>
+  <line x1="290" y1="72" x2="275" y2="108" stroke="#0b6e69" marker-end="url(#a)"/>
+  <line x1="390" y1="72" x2="405" y2="108" stroke="#0b6e69" marker-end="url(#a)"/>
+  <text x="490" y="95" fill="#0b6e69" font-size="9.5">socketpair: config (+ fds en BSD)</text>
+  <line x1="480" y1="140" x2="567" y2="100" stroke="#5b6475" marker-end="url(#a)"/>
+  <line x1="480" y1="155" x2="567" y2="155" stroke="#5b6475" marker-end="url(#a)"/>
+  <line x1="480" y1="170" x2="567" y2="208" stroke="#5b6475" marker-end="url(#a)"/>
+  <text x="525" y="128" fill="#5b6475" font-size="9.5">keep-alive</text>
+  <line x1="265" y1="202" x2="265" y2="233" stroke="#5b6475" stroke-dasharray="3 3"/>
+  <line x1="415" y1="202" x2="415" y2="233" stroke="#5b6475" stroke-dasharray="3 3"/>
+</svg>
+<figcaption>Figura 1. Master, workers y memoria compartida. Cada worker es un proceso independiente con un único hilo de event loop.</figcaption>
+</figure>
+
+<p>El <strong>master</strong> no atiende tráfico. Valida la configuración, crea los workers con <code>fork()</code>, les envía la config por un <code>socketpair</code>, vigila el fichero, atiende las señales, relanza workers caídos y sirve las estadísticas. Cada <strong>worker</strong> ejecuta un event loop de un solo hilo y dos hilos auxiliares (sondas de salud y escritura del log) que nunca tocan las conexiones.</p>
+
+<h3>Flujo de una petición</h3>
+<ol>
+  <li>El kernel entrega la conexión a un worker (<code>SO_REUSEPORT</code> en Linux).</li>
+  <li>Si el frontend es TLS, se completa el handshake y se elige el certificado por SNI.</li>
+  <li>Se parsea la cabecera en cuanto está completa y se busca la ruta por <code>Host:</code>: exacta → wildcard → <code>default</code>.</li>
+  <li>La estrategia del backend elige un servidor sano. Se reutiliza una conexión del pool keep-alive o se abre una nueva.</li>
+  <li>Se reenvía la cabecera reescrita (<code>X-Forwarded-*</code>, sin hop-by-hop) y el cuerpo en streaming.</li>
+  <li>La respuesta vuelve reescrita (sin <code>X-Backend-Load</code>). Al terminar, la conexión al backend vuelve al pool y la del cliente espera la siguiente petición.</li>
+</ol>
+
+<h3>Estructura del código</h3>
+<table>
+  <tr><th>Módulo</th><th>Responsabilidad</th></tr>
+  <tr><td><code>io_event_*</code></td><td>Event loop sobre epoll/kqueue, timers y callbacks diferidos</td></tr>
+  <tr><td><code>master</code>, <code>main</code></td><td>Arranque, workers, recarga, señales y socket de estadísticas</td></tr>
+  <tr><td><code>worker</code></td><td>Loop del worker, accept, swap de generaciones y parada ordenada</td></tr>
+  <tr><td><code>listener</code></td><td>Sockets de escucha y canal master→worker (paso de fds con <code>SCM_RIGHTS</code>)</td></tr>
+  <tr><td><code>connection</code></td><td>Máquina de estados cliente↔upstream, pool keep-alive, reintentos y timeouts</td></tr>
+  <tr><td><code>http_parser</code></td><td>Parser HTTP/1.x incremental y delimitación de cuerpos</td></tr>
+  <tr><td><code>tls</code></td><td>Contextos OpenSSL por certificado y callback de SNI</td></tr>
+  <tr><td><code>router</code></td><td>Tabla hash djb2 de dominios exactos, wildcards por sufijo más largo, default</td></tr>
+  <tr><td><code>backend_pool</code></td><td>Servidores, estrategias de balanceo y estado de salud atómico</td></tr>
+  <tr><td><code>health</code></td><td>Sondas TCP/HTTP en un hilo por generación</td></tr>
+  <tr><td><code>runtime</code></td><td>Generación de config "compilada" con refcount (RCU)</td></tr>
+  <tr><td><code>config</code></td><td>Parser TOML (tomlc99) con validación estricta</td></tr>
+  <tr><td><code>watch_*</code></td><td>Vigilancia del fichero: inotify / <code>EVFILT_VNODE</code></td></tr>
+  <tr><td><code>log</code></td><td>Ring buffer MPSC de 4096 × 512 B y hilo consumidor</td></tr>
+  <tr><td><code>stats</code></td><td>Memoria compartida y JSON agregado</td></tr>
+  <tr><td><code>buffer_pool</code></td><td>Arena <code>mmap</code> de slots de 16 KB con freelist</td></tr>
+</table>
+<p>Todo salvo <code>main</code>, <code>master</code>, <code>worker</code>, <code>runtime</code>, <code>listener</code> y <code>connection</code> se compila como la biblioteca estática <code>proxycore</code>, que reutilizan los tests unitarios y las herramientas <code>test_backend</code> y <code>ws_probe</code>.</p>
+
+<!-- ============================================================ -->
+<h2>Event loop (<code>io_event</code>)</h2>
+
+<h3>API</h3>
+<pre><code>io_loop_t *io_loop_create(int max_events);
+int  io_loop_add(io_loop_t *, int fd, uint32_t events, io_handler_t *h);
+int  io_loop_mod(io_loop_t *, int fd, uint32_t events, io_handler_t *h);
+int  io_loop_del(io_loop_t *, int fd);
+int  io_loop_run(io_loop_t *);            <span class="c">/* hasta io_loop_stop() */</span>
+void io_loop_stop(io_loop_t *);
+void io_loop_destroy(io_loop_t *);
+void io_loop_abandon(io_loop_t *);        <span class="c">/* tras fork(): no toca el kernel */</span>
+
+void io_timer_set(io_loop_t *, io_timer_t *, uint64_t deadline_ms);
+void io_timer_cancel(io_loop_t *, io_timer_t *);
+void io_loop_defer(io_loop_t *, void (*fn)(void *), void *arg);
+<span class="c">/* eventos: IO_READ, IO_WRITE, IO_ERROR, IO_HUP */</span></code></pre>
+<p>Cada objeto registrado embebe un <code>io_handler_t</code> con su callback. <code>io_event_epoll.c</code> y <code>io_event_kqueue.c</code> implementan solo <code>add/mod/del</code> y la espera; los timers y los callbacks diferidos son comunes (<code>io_event_common.c</code>).</p>
+
+<h3>Edge-triggered y <code>sess_drive</code></h3>
+<p>Todos los fds se registran una sola vez, con lectura y escritura, en modo <strong>edge-triggered</strong> (<code>EPOLLET</code> / <code>EV_CLEAR</code>). El kernel avisa una vez por cambio de estado, así que cada sesión lleva dos flags por fd: <code>rd</code> y <code>wr</code> ("el último intento no terminó en <code>EAGAIN</code>").</p>
+<pre><code>sess_drive(s):
+  repetir (máx. 32 vueltas):
+    cli_read      <span class="c">/* socket cliente → in (hasta EAGAIN o buffer lleno) */</span>
+    process       <span class="c">/* parsear, enrutar, mover cuerpo in → uo           */</span>
+    up_io         <span class="c">/* connect, uo → backend, backend → ui               */</span>
+    process       <span class="c">/* respuesta ui → out                                */</span>
+    cli_write     <span class="c">/* out → socket cliente                              */</span>
+  mientras haya progreso
+  si se agota el presupuesto: io_loop_defer(redrive)</code></pre>
+<p>Como se repite hasta que no hay progreso, nunca queda trabajo pendiente sin un evento que lo despierte, el error clásico con edge-triggered. El presupuesto de 32 vueltas evita que una transferencia grande acapare el loop.</p>
+
+<h3>Timers y reloj</h3>
+<p>Los timers viven en un min-heap. <code>io_timer_set</code> es <strong>perezoso</strong>: retrasar un deadline solo actualiza un campo, y el timer se reubica cuando vence su clave antigua; adelantarlo sí reordena el heap. Así, refrescar un timeout con cada byte recibido cuesta O(1).</p>
+<div class="warn"><p><strong>Bug corregido.</strong> <code>io_loop_now()</code> es un reloj cacheado por iteración. En la primera versión se actualizaba <em>después</em> de despachar los eventos, así que tras un periodo ocioso los handlers calculaban deadlines ya vencidos (408/504 espurios). Ahora se actualiza justo después de <code>epoll_wait</code>/<code>kevent</code>, con un test de regresión (<code>test_now_fresh_in_handler</code>).</p></div>
+
+<h3>Liberación diferida</h3>
+<p>Un mismo lote de <code>epoll_wait</code> puede traer varios eventos de un objeto que se cierra al procesar el primero. Liberarlo en ese momento sería un use-after-free. Por eso <code>close</code> marca el objeto como cerrado (los eventos tardíos se ignoran) y el <code>free</code> se encola con <code>io_loop_defer</code>, que se ejecuta al final de la iteración en orden FIFO.</p>
+
+<!-- ============================================================ -->
+<h2>Master y workers</h2>
+
+<h3>Canal master → worker</h3>
+<p>Cada worker recibe su configuración por un <code>socketpair</code>. El mensaje lleva una cabecera fija y, en BSD, descriptores adjuntos (<code>SCM_RIGHTS</code>):</p>
+<pre><code>{ magic = 0x50525859, cmd = CHAN_CONFIG, len, nfds }
+payload: base_dir '\0' texto_toml '\0' claves_de_listener separadas por '\n'</code></pre>
+<p>El master envía el <strong>texto</strong> ya validado en lugar de pedir a cada worker que relea el fichero. Así todos aplican exactamente la misma versión aunque el fichero cambie mientras tanto. Si el canal se cierra (murió el master), el worker inicia una parada ordenada: no quedan procesos huérfanos.</p>
+
+<h3>Sockets de escucha</h3>
+<table>
+  <tr><th>Plataforma</th><th>Estrategia</th><th>Motivo</th></tr>
+  <tr><td>Linux</td><td>Cada worker abre sus sockets con <code>SO_REUSEPORT</code></td><td>El kernel reparte las conexiones por hash, sin <em>thundering herd</em></td></tr>
+  <tr><td>macOS/BSD</td><td>El master abre los sockets y los envía a los workers por el canal</td><td>Allí <code>SO_REUSEPORT</code> no reparte carga</td></tr>
+</table>
+<p>En una recarga, cada worker sincroniza sus listeners con los frontends nuevos: conserva los existentes, abre los añadidos y cierra los eliminados.</p>
+
+<h3>Señales, relanzamiento y parada</h3>
+<table>
+  <tr><th>Evento</th><th>Master</th><th>Worker</th></tr>
+  <tr><td><code>SIGHUP</code></td><td>Recarga forzada</td><td>Ignorada (la coordina el master)</td></tr>
+  <tr><td>Cambio en el fichero</td><td>Recarga tras 200 ms de debounce, solo si el contenido cambió</td><td>—</td></tr>
+  <tr><td><code>SIGTERM</code> / <code>SIGINT</code></td><td>Reenvía <code>SIGTERM</code>, espera 12 s y luego <code>SIGKILL</code></td><td>Cierra listeners y conexiones ociosas; espera hasta 10 s a las activas</td></tr>
+  <tr><td><code>SIGCHLD</code></td><td>Relanza el worker con backoff; abandona tras 10 fallos seguidos al arrancar</td><td>—</td></tr>
+</table>
+<p>Todas las señales se procesan con el <em>self-pipe trick</em>: el handler solo escribe un byte en una tubería registrada en el loop.</p>
+
+<!-- ============================================================ -->
+<h2>Ciclo de vida de una conexión</h2>
+
+<h3>Máquina de estados</h3>
+<figure>
+<svg viewBox="0 0 680 210" xmlns="http://www.w3.org/2000/svg" font-family="Ubuntu Sans, sans-serif" font-size="11">
+  <defs><marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#0b6e69"/></marker></defs>
+  <g fill="#e6f2f1" stroke="#0b6e69">
+    <rect x="10" y="30" width="100" height="36" rx="18"/>
+    <rect x="160" y="30" width="100" height="36" rx="18"/>
+    <rect x="320" y="30" width="100" height="36" rx="18"/>
+    <rect x="480" y="30" width="100" height="36" rx="18"/>
+    <rect x="320" y="140" width="100" height="36" rx="18"/>
+    <rect x="480" y="140" width="100" height="36" rx="18"/>
+  </g>
+  <g text-anchor="middle" font-weight="600">
+    <text x="60" y="52">HANDSHAKE</text>
+    <text x="210" y="52">HEAD</text>
+    <text x="370" y="52">PROXY</text>
+    <text x="530" y="52">TUNNEL</text>
+    <text x="370" y="162">CLOSING</text>
+    <text x="530" y="162">LINGER</text>
+  </g>
+  <g stroke="#0b6e69" fill="none" marker-end="url(#b)">
+    <line x1="110" y1="48" x2="158" y2="48"/>
+    <line x1="260" y1="44" x2="318" y2="44"/>
+    <path d="M320,56 C290,80 260,80 245,68"/>
+    <line x1="420" y1="48" x2="478" y2="48"/>
+    <line x1="370" y1="66" x2="370" y2="138"/>
+    <path d="M210,66 C210,150 250,158 318,158"/>
+    <path d="M530,66 C530,110 450,130 415,139"/>
+    <line x1="420" y1="158" x2="478" y2="158"/>
+  </g>
+  <g font-size="9.5" fill="#5b6475" text-anchor="middle">
+    <text x="134" y="40">TLS ok</text>
+    <text x="289" y="36">cabecera ok</text>
+    <text x="282" y="94">respuesta completa + keep-alive</text>
+    <text x="449" y="40">101</text>
+    <text x="378" y="104" text-anchor="start">error / sin keep-alive</text>
+    <text x="165" y="130">EOF / 400 / 408 / 431</text>
+    <text x="590" y="100">fin del túnel</text>
+    <text x="449" y="150">out vacío</text>
+  </g>
+  <text x="10" y="200" font-size="9.5" fill="#5b6475">LINGER: shutdown(SHUT_WR) y descartar la entrada hasta EOF o 2 s, para que un RST no se coma la respuesta.</text>
+</svg>
+<figcaption>Figura 2. Estados de una sesión de cliente (<code>connection.c</code>).</figcaption>
+</figure>
+
+<h3>Buffers y contrapresión</h3>
+<figure>
+<svg viewBox="0 0 680 120" xmlns="http://www.w3.org/2000/svg" font-family="Ubuntu Sans, sans-serif" font-size="11">
+  <defs><marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b6475"/></marker></defs>
+  <rect x="10" y="35" width="80" height="50" rx="6" fill="#fff" stroke="#5b6475"/><text x="50" y="64" text-anchor="middle" font-weight="600">cliente</text>
+  <rect x="590" y="35" width="80" height="50" rx="6" fill="#fff" stroke="#5b6475"/><text x="630" y="64" text-anchor="middle" font-weight="600">backend</text>
+  <g fill="#f4f6f9" stroke="#0b6e69">
+    <rect x="150" y="15" width="130" height="30" rx="4"/><rect x="400" y="15" width="130" height="30" rx="4"/>
+    <rect x="150" y="75" width="130" height="30" rx="4"/><rect x="400" y="75" width="130" height="30" rx="4"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="215" y="34"><tspan font-weight="600">in</tspan> (crudo)</text>
+    <text x="465" y="34"><tspan font-weight="600">uo</tspan> (reescrito)</text>
+    <text x="215" y="94"><tspan font-weight="600">out</tspan> (reescrito)</text>
+    <text x="465" y="94"><tspan font-weight="600">ui</tspan> (crudo)</text>
+  </g>
+  <g stroke="#5b6475" marker-end="url(#c)">
+    <line x1="90" y1="45" x2="148" y2="30"/><line x1="280" y1="30" x2="398" y2="30"/><line x1="530" y1="30" x2="588" y2="45"/>
+    <line x1="588" y1="75" x2="532" y2="90"/><line x1="398" y1="90" x2="282" y2="90"/><line x1="148" y1="90" x2="92" y2="75"/>
+  </g>
+  <text x="340" y="24" text-anchor="middle" font-size="9.5" fill="#5b6475">process()</text>
+  <text x="340" y="84" text-anchor="middle" font-size="9.5" fill="#5b6475">process()</text>
+</svg>
+<figcaption>Figura 3. Los cuatro buffers de 16 KB de una sesión.</figcaption>
+</figure>
+<p>Los buffers salen de un pool <code>mmap</code> por worker y se piden solo cuando hacen falta: una conexión keep-alive ociosa no retiene ninguno. La contrapresión sale sola. Si <code>out</code> se llena porque el cliente lee despacio, <code>process</code> deja de vaciar <code>ui</code>, se deja de leer del backend y la ventana TCP frena al servidor. Con 10 MB de subida, el pico de memoria medido por worker fue de 13 MB.</p>
+
+<h3>Timeouts</h3>
+<table>
+  <tr><th>Estado</th><th>Deadline</th><th>Al vencer</th></tr>
+  <tr><td>HANDSHAKE</td><td>aceptación + <code>client_header</code></td><td>cerrar</td></tr>
+  <tr><td>HEAD, sin datos</td><td>entrada en el estado + <code>client_idle</code></td><td>cerrar (keep-alive ocioso)</td></tr>
+  <tr><td>HEAD, cabecera a medias</td><td>primer byte + <code>client_header</code></td><td><code>408</code></td></tr>
+  <tr><td>PROXY, conectando</td><td>inicio del connect + <code>upstream_connect</code></td><td>fallo pasivo; otro servidor, o <code>504</code></td></tr>
+  <tr><td>PROXY</td><td>último progreso + <code>upstream_read</code></td><td><code>504</code> (o cerrar si ya hay respuesta a medias)</td></tr>
+  <tr><td>TUNNEL</td><td>último progreso + <code>client_idle</code></td><td>cerrar</td></tr>
+  <tr><td>CLOSING / LINGER</td><td>5 s / 2 s</td><td>cerrar</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>HTTP/1.1</h2>
+
+<h3>Parser</h3>
+<p>La cabecera se busca como <code>\r\n\r\n</code>, recordando hasta dónde se ha escaneado, y se parsea de una vez cuando está completa. Los campos son punteros al buffer, sin copias. Así se tolera cualquier fragmentación (hay tests que alimentan el parser byte a byte y en trozos aleatorios) sin reescanear. Validaciones:</p>
+<ul>
+  <li>Método como <em>token</em>, versión exactamente <code>HTTP/1.0</code> o <code>HTTP/1.1</code>, un único espacio entre elementos.</li>
+  <li>Nombres de cabecera como <em>token</em>, sin espacio antes de <code>:</code>. Se rechazan el <em>obs-fold</em> y los caracteres de control.</li>
+  <li><code>Host</code> obligatorio en 1.1 y único; se le quita el puerto.</li>
+  <li><strong>Anti request smuggling</strong>: <code>Content-Length</code> + <code>Transfer-Encoding</code> → 400; varios CL distintos → 400; TE sin <code>chunked</code> final → 400.</li>
+  <li>Cabecera de más de 16 KB → 431.</li>
+</ul>
+
+<h3>Reescritura de cabeceras</h3>
+<table>
+  <tr><th>Hacia el backend</th><th>Hacia el cliente</th></tr>
+  <tr><td>Línea de petición reescrita a <code>HTTP/1.1</code><br>
+    <code>X-Forwarded-For</code>: se añade la IP (concatenando)<br>
+    <code>X-Forwarded-Proto</code> y <code>X-Real-IP</code>: se reemplazan<br>
+    Sin hop-by-hop (<code>Connection</code>, <code>Keep-Alive</code>, <code>TE</code>, <code>Trailer</code>, <code>Upgrade</code>… y las nombradas en <code>Connection</code>)</td>
+  <td>Sin hop-by-hop ni <code>X-Backend-Load</code><br>
+    <code>Connection: close</code> si se va a cerrar<br>
+    <code>Connection: keep-alive</code> para clientes 1.0 persistentes<br>
+    En un <code>101</code> se conservan <code>Connection</code> y <code>Upgrade</code></td></tr>
+</table>
+<p>Nunca se eliminan <code>Host</code>, <code>Content-Length</code> ni <code>Transfer-Encoding</code>, aunque aparezcan en <code>Connection:</code>: si se pudiera forzar al proxy a quitar el encuadre, eso sería un vector de smuggling.</p>
+
+<h3>Cuerpos</h3>
+<p><code>http_body_t</code> solo sigue los límites del mensaje. Los bytes se reenvían tal cual, sin decodificar ni almacenar.</p>
+<table>
+  <tr><th>Modo</th><th>Cuándo</th></tr>
+  <tr><td><code>NONE</code></td><td>Sin cuerpo; <code>HEAD</code>, <code>1xx</code>, <code>204</code>, <code>304</code></td></tr>
+  <tr><td><code>LENGTH</code></td><td><code>Content-Length</code></td></tr>
+  <tr><td><code>CHUNKED</code></td><td>Máquina de estados de 9 estados: tamaño hex, extensiones, datos, CRLF y trailers</td></tr>
+  <tr><td><code>EOF</code></td><td>Respuesta sin longitud: se reenvía hasta el cierre y después se cierra también el cliente</td></tr>
+</table>
+
+<h3>Keep-alive, pool y reintento</h3>
+<ul>
+  <li><strong>Cliente</strong>: persistente por defecto en 1.1; en 1.0 solo con <code>Connection: keep-alive</code>.</li>
+  <li><strong>Backend</strong>: pool LIFO de conexiones ociosas por servidor (<code>max_idle</code>, <code>upstream_idle</code>). Una conexión vuelve al pool si la respuesta terminó limpia, el backend no pidió cerrar y no sobran bytes. Mientras está en el pool, cualquier dato o cierre la invalida (se confirma con <code>MSG_PEEK</code> para descartar eventos tardíos).</li>
+  <li><strong>Reintento único</strong>: si una conexión <em>reutilizada</em> falla antes del primer byte de respuesta y la petición es idempotente y sin cuerpo, se reenvía por una conexión nueva. Para eso se conserva la cabecera ya enviada en <code>uo</code>. Un POST nunca se reintenta.</li>
+  <li>Si el connect falla, se prueba con otro servidor (hasta 3 intentos, excluyendo los ya probados).</li>
+</ul>
+
+<h3>Pipelining y WebSocket</h3>
+<p>Las peticiones pipelined se leen por adelantado hasta llenar <code>in</code>, pero se despachan en serie: la siguiente empieza cuando la respuesta anterior se ha leído entera del backend. Así el orden queda garantizado sin colas, y cada petición puede ir a un backend distinto.</p>
+<p>Si la petición trae <code>Connection: Upgrade</code> y el backend responde <code>101</code>, la sesión pasa a <strong>TUNNEL</strong>: copia bytes en ambos sentidos hasta que un lado cierra. La conexión nunca vuelve al pool.</p>
+
+<h3>Errores generados por el proxy</h3>
+<table>
+  <tr><th>Código</th><th>Causa</th></tr>
+  <tr><td>400</td><td>Petición malformada, smuggling, chunked inválido, 1.1 sin <code>Host</code></td></tr>
+  <tr><td>404</td><td>Ninguna ruta (ni <code>default</code>) para el <code>Host</code></td></tr>
+  <tr><td>408</td><td>Cabecera incompleta tras <code>client_header</code></td></tr>
+  <tr><td>421</td><td>SNI y <code>Host</code> distintos, y el certificado servido no cubre el <code>Host</code></td></tr>
+  <tr><td>431</td><td>Cabecera de más de 16 KB</td></tr>
+  <tr><td>502</td><td>Backend inalcanzable tras los intentos, respuesta inválida o conexión rota</td></tr>
+  <tr><td>503</td><td>Ningún servidor sano en el backend, o frontend eliminado en una recarga</td></tr>
+  <tr><td>504</td><td>Sin datos del backend durante <code>upstream_read</code></td></tr>
+</table>
+<p>Todas estas respuestas llevan <code>Connection: close</code>.</p>
+
+<!-- ============================================================ -->
+<h2>TLS y SNI</h2>
+<p>Cada certificado de un frontend tiene su <code>SSL_CTX</code> (TLS ≥ 1.2, sin compresión ni renegociación, escrituras parciales). El SSL nace con el contexto del <code>default_cert</code>, y el callback de servername lo cambia con <code>SSL_set_SSL_CTX</code> según este orden:</p>
+<ol>
+  <li>Coincidencia exacta con el patrón <code>sni</code> de la config.</li>
+  <li>Wildcard de <strong>una sola etiqueta</strong> (RFC 6125): <code>*.example.com</code> cubre <code>a.example.com</code>, no <code>a.b.example.com</code>. Gana el patrón más largo.</li>
+  <li>Si no hay coincidencia, <code>default_cert</code>.</li>
+</ol>
+<p>Tras el handshake, la sesión copia el nombre SNI y el patrón servido. Si el cliente envió SNI, el <code>Host</code> es distinto y el patrón no lo cubre → <code>421 Misdirected Request</code>. El handshake no bloquea: <code>SSL_ERROR_WANT_READ/WRITE</code> se traducen a los flags <code>rd</code>/<code>wr</code>, incluidos los casos cruzados (una lectura que necesita escribir, y al revés).</p>
+
+<!-- ============================================================ -->
+<h2>Enrutamiento, balanceo y salud</h2>
+
+<h3>Enrutamiento</h3>
+<p>Cada frontend tiene su tabla: hash djb2 con direccionamiento abierto para dominios exactos, lista de wildcards ordenada por longitud de sufijo (el más largo gana; aquí sí cubren varias etiquetas) y ruta <code>default</code> opcional. Todas las búsquedas son insensibles a mayúsculas.</p>
+
+<h3>Estrategias de balanceo</h3>
+<table>
+  <tr><th>Estrategia</th><th>Algoritmo</th></tr>
+  <tr><td><code>round_robin</code></td><td>Siguiente servidor sano en orden</td></tr>
+  <tr><td><code>weighted</code></td><td><em>Smooth weighted round robin</em> (nginx): con pesos 3:1 reparte 75/25 sin ráfagas largas</td></tr>
+  <tr><td><code>least_conn</code></td><td>Menos peticiones activas en este worker; si empatan, rotación</td></tr>
+  <tr><td><code>least_load</code></td><td>Carga de <code>X-Backend-Load</code> suavizada con EMA (α = 0,3), que caduca a los 5 s. Se eligen dos candidatos al azar (<em>power of two choices</em>) y gana el de menor carga. Si no hay carga fresca, decide <code>least_conn</code>; si también empatan, gana el que no tiene carga conocida (exploración)</td></tr>
+</table>
+
+<h3>Salud</h3>
+<ul>
+  <li><strong>Pasiva</strong> (hilo del loop): connect rechazado o reset antes de la respuesta cuentan como fallo; tras <code>fall</code> fallos seguidos, el servidor pasa a <code>down</code>. Sin sondas activas, pasado <code>interval</code> se reintenta en modo <em>half-open</em>: basta un fallo para volver a <code>down</code>.</li>
+  <li><strong>Activa</strong> (hilo propio por generación): TCP connect o <code>GET path</code> esperando <code>2xx</code>, cada <code>interval</code>; tras <code>rise</code> éxitos, <code>up</code>.</li>
+  <li>El estado (<code>up</code>, <code>fails</code>, <code>oks</code>) es atómico: es lo único que comparten los dos hilos.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>Configuración y recarga en caliente</h2>
+<figure>
+<svg viewBox="0 0 680 150" xmlns="http://www.w3.org/2000/svg" font-family="Ubuntu Sans, sans-serif" font-size="11">
+  <defs><marker id="d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5b6475"/></marker></defs>
+  <rect x="10" y="20" width="120" height="44" rx="6" fill="#fff" stroke="#5b6475"/><text x="70" y="38" text-anchor="middle" font-weight="600">W.rt (actual)</text><text x="70" y="54" text-anchor="middle" fill="#5b6475">refcnt = 1 + peticiones</text>
+  <rect x="200" y="10" width="150" height="64" rx="6" fill="#e6f2f1" stroke="#0b6e69"/><text x="275" y="30" text-anchor="middle" font-weight="600">generación N+1</text><text x="275" y="46" text-anchor="middle">routers · TLS · backends</text><text x="275" y="61" text-anchor="middle">hilo de health</text>
+  <rect x="200" y="90" width="150" height="50" rx="6" fill="#f4f6f9" stroke="#5b6475"/><text x="275" y="110" text-anchor="middle" font-weight="600">generación N (retirada)</text><text x="275" y="126" text-anchor="middle" fill="#5b6475">peticiones en vuelo</text>
+  <rect x="440" y="90" width="230" height="50" rx="6" fill="#fff" stroke="#5b6475" stroke-dasharray="4 3"/><text x="555" y="110" text-anchor="middle">refcnt = 0 y health terminado</text><text x="555" y="126" text-anchor="middle" fill="#5b6475">→ se cierra su pool y se libera (tick de 250 ms)</text>
+  <line x1="130" y1="40" x2="198" y2="40" stroke="#0b6e69" marker-end="url(#d)"/><text x="164" y="32" text-anchor="middle" font-size="9.5" fill="#0b6e69">swap</text>
+  <line x1="350" y1="115" x2="438" y2="115" stroke="#5b6475" marker-end="url(#d)"/>
+</svg>
+<figcaption>Figura 4. Generaciones de configuración con refcount (RCU sin atómicos: todo ocurre en el hilo del loop).</figcaption>
+</figure>
+<ol>
+  <li><strong>Disparo</strong>: inotify sobre el <em>directorio</em> (cubre la escritura in situ y el rename de <code>vim</code>/<code>sed -i</code>), <code>EVFILT_VNODE</code> sobre fichero y directorio en kqueue, o <code>SIGHUP</code>. Debounce de 200 ms. Si el contenido no cambió, no se hace nada (salvo con SIGHUP).</li>
+  <li><strong>Validación en el master</strong>: TOML, reglas de coherencia y carga de certificados. Si falla, se registra el error y se mantiene la configuración actual.</li>
+  <li><strong>Envío</strong> del texto a cada worker, que construye la nueva generación, sincroniza sus listeners y cambia el puntero.</li>
+  <li>Las peticiones en vuelo terminan con su generación; en las conexiones keep-alive, la petición siguiente ya usa la nueva.</li>
+</ol>
+<p>La validación es estricta: una clave desconocida (<code>workerz</code>) es un error. Así una errata no se ignora en silencio.</p>
+
+<!-- ============================================================ -->
+<h2>Observabilidad</h2>
+<h3>Log</h3>
+<p>Cada proceso tiene un ring buffer MPSC sin locks (cola acotada de Vyukov, 4096 × 512 B). El event loop y el hilo de health escriben en él, y un hilo consumidor vuelca bloques de hasta 64 KB con <code>write()</code> en <code>O_APPEND</code>, que no parte las líneas entre procesos. Si el ring se llena, el mensaje se descarta y se incrementa <code>log_dropped</code>: el loop nunca se bloquea.</p>
+<h3>Estadísticas</h3>
+<p>El master crea una región <code>mmap(MAP_SHARED)</code> antes del <code>fork</code>. Cada worker incrementa sus contadores atómicos (<em>relaxed</em>, cada uno en su línea de caché) y cada 250 ms publica su tabla de servidores con un seqlock. El master agrega todo y sirve JSON por el socket UNIX <code>stats_socket</code>. Un servidor aparece como <code>degraded</code> cuando los workers discrepan sobre su salud.</p>
+
+<!-- ============================================================ -->
+<h2>Pruebas y rendimiento</h2>
+<h3>Estrategia de pruebas</h3>
+<table>
+  <tr><th>Nivel</th><th>Contenido</th><th class="n">Casos</th></tr>
+  <tr><td>Unitario (cmocka)</td><td>Parser (fragmentación, límites, smuggling, chunked), router, balanceo (4 estrategias, salud), config (17 reglas), núcleo (pool, timers, reloj, ring de log concurrente)</td><td class="n">31</td></tr>
+  <tr><td>Integración</td><td>12 backends reales y el proxy: enrutamiento, errores, cabeceras, cuerpos de 10 MB, keep-alive, pool, reintento, pipelining, timeouts, WebSocket, TLS/SNI, balanceo, failover, recarga, stats, relanzamiento, carga con recargas y parada</td><td class="n">96</td></tr>
+  <tr><td>Sanitizers</td><td>Todo lo anterior con AddressSanitizer + UBSan + LeakSanitizer</td><td class="n">0 informes</td></tr>
+</table>
+<p>Herramientas propias: <code>test_backend</code> (HTTP/1.1 y WebSocket sobre <code>io_event</code>, con latencia, carga y descarte de conexiones configurables) y <code>ws_probe</code> (cliente WebSocket en C, con TLS).</p>
+
+<h3>Benchmark</h3>
+<table>
+  <tr><th>Escenario (wrk, 30 s)</th><th>Protocolo</th><th class="n">Req/s</th><th class="n">Latencia media</th><th class="n">p99</th><th class="n">Errores</th></tr>
+  <tr><td><code>-t4 -c100</code></td><td>HTTPS</td><td class="n"><strong>223.705</strong></td><td class="n">0,43 ms</td><td class="n">1,29 ms</td><td class="n">0</td></tr>
+  <tr><td><code>-t4 -c200</code></td><td>HTTPS</td><td class="n"><strong>213.565</strong></td><td class="n">0,85 ms</td><td class="n">2,37 ms</td><td class="n">0</td></tr>
+  <tr><td><code>-t4 -c400</code></td><td>HTTPS</td><td class="n"><strong>172.075</strong></td><td class="n">1,97 ms</td><td class="n">4,78 ms</td><td class="n">0</td></tr>
+  <tr><td><code>-t4 -c200</code></td><td>HTTP</td><td class="n"><strong>337.904</strong></td><td class="n">0,53 ms</td><td class="n">1,80 ms</td><td class="n">0</td></tr>
+</table>
+<figure>
+<svg viewBox="0 0 680 190" xmlns="http://www.w3.org/2000/svg" font-family="Ubuntu Sans, sans-serif" font-size="11">
+  <line x1="150" y1="10" x2="150" y2="170" stroke="#d9dee7"/>
+  <!-- escala: 350k = 500px -> 1px = 700 req/s -->
+  <line x1="221" y1="10" x2="221" y2="170" stroke="#9a5b00" stroke-dasharray="4 3"/>
+  <text x="225" y="182" fill="#9a5b00" font-size="9.5">meta 50.000</text>
+  <g font-size="10.5">
+    <text x="144" y="32" text-anchor="end">HTTPS c100</text><rect x="150" y="20" width="319" height="18" fill="#0b6e69"/><text x="475" y="33">223.705</text>
+    <text x="144" y="68" text-anchor="end">HTTPS c200</text><rect x="150" y="56" width="305" height="18" fill="#0b6e69"/><text x="461" y="69">213.565</text>
+    <text x="144" y="104" text-anchor="end">HTTPS c400</text><rect x="150" y="92" width="246" height="18" fill="#0b6e69"/><text x="402" y="105">172.075</text>
+    <text x="144" y="140" text-anchor="end">HTTP c200</text><rect x="150" y="128" width="483" height="18" fill="#7fb8b4"/><text x="639" y="141" text-anchor="end" fill="#fff" font-weight="600">337.904</text>
+  </g>
+</svg>
+<figcaption>Figura 5. Peticiones por segundo frente a la meta de 50.000.</figcaption>
+</figure>
+<p><strong>Entorno</strong>: AMD Ryzen 7 7735HS (8 núcleos / 16 hilos) en WSL2, kernel 6.18, OpenSSL 3.5.5. Build release + LTO, 8 workers, access log desactivado, 2 <code>test_backend</code> de 2 hilos y respuesta de 100 B. Afinidad con <code>taskset</code>: wrk en las CPUs 0-3, el proxy en 4-11 y los backends en 12-15. Hubo 28,5 M peticiones, todas 2xx, servidas con solo 816 conexiones a los backends gracias al pool. Como wrk, proxy y backends comparten máquina, las cifras son una cota inferior.</p>
+
+<!-- ============================================================ -->
+<h2>Decisiones de diseño y limitaciones</h2>
+<table>
+  <tr><th>Decisión</th><th>Alternativa descartada</th><th>Motivo</th></tr>
+  <tr><td>Procesos (master + workers)</td><td>Un proceso con N hilos</td><td>Aislamiento de fallos; sin sincronización entre loops</td></tr>
+  <tr><td>ET con un único registro por fd</td><td>LT, o <code>EPOLL_CTL_MOD</code> por cambio de estado</td><td>Menos syscalls; <code>sess_drive</code> evita perder eventos</td></tr>
+  <tr><td>Cabecera completa + delimitación de cuerpo aparte</td><td>Parser byte a byte con estado global</td><td>Más simple; sin copias ni reescaneo</td></tr>
+  <tr><td>Copia en buffers de 16 KB</td><td><code>splice()</code> / zero-copy</td><td>Con TLS y reescritura de cabeceras los datos pasan por userland igualmente</td></tr>
+  <tr><td>Pipelining en serie</td><td>Varias peticiones en vuelo hacia backends distintos</td><td>Orden garantizado sin colas de respuesta</td></tr>
+  <tr><td>Errores locales con <code>Connection: close</code></td><td>Mantener keep-alive tras un error</td><td>Puede quedar un cuerpo a medio leer; cerrar es lo seguro</td></tr>
+  <tr><td>Reintento solo idempotente, sin cuerpo y en conexión reutilizada</td><td>Reintentar cualquier fallo</td><td>No duplicar operaciones con efectos</td></tr>
+  <tr><td>Health por worker</td><td>Estado compartido entre procesos</td><td>Sin locks entre procesos; se expone <code>degraded</code></td></tr>
+  <tr><td>El master envía el texto de la config</td><td>Cada worker relee el fichero</td><td>Todos aplican la misma versión validada</td></tr>
+</table>
+<h3>Limitaciones conocidas</h3>
+<ul>
+  <li>El código kqueue (macOS/BSD) está implementado, pero solo se ha comprobado su sintaxis: falta ejecutarlo en un Mac.</li>
+  <li>Un cliente HTTP/1.0 recibe tal cual las respuestas chunked del backend.</li>
+  <li>Cambiar <code>workers</code> requiere reiniciar.</li>
+  <li>En una recarga, cada worker lee los certificados del disco en el hilo del loop (milisegundos, y solo al recargar).</li>
+  <li>El timeout <code>upstream_connect</code> no tiene test automático: en loopback un connect rechazado falla al instante.</li>
+</ul>
+
+</body>
+</html>

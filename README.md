@@ -71,6 +71,14 @@ Herramientas de prueba (`tools/`): `test_backend` (backend HTTP/1.1 + WebSocket 
 
 Las decisiones de diseño, con sus alternativas, están en [`docs/decisiones.md`](docs/decisiones.md). La trazabilidad requerimiento → test está en [`docs/verificacion.md`](docs/verificacion.md).
 
+**Documentación completa:**
+- [Documentación técnica (PDF)](docs/pdf/documentacion-tecnica.pdf): arquitectura, módulos, protocolos, pruebas y rendimiento.
+- [Manual de usuario (PDF)](docs/pdf/manual-de-usuario.pdf): instalación, configuración, operación y resolución de problemas.
+- [Presentación (PPTX)](docs/presentacion/proxy-l7.pptx): decisiones técnicas, benchmark y coste.
+- [Resumen de la sesión](docs/Resumen.md).
+
+Los fuentes de los PDF están en `docs/pdf/src/` (HTML + CSS de impresión, renderizados con Chromium headless) y la presentación se genera con `docs/presentacion/generar.mjs` (pptxgenjs).
+
 ## 📊 Benchmark (Linux, wrk, build release)
 
 Meta: **≥ 50.000 req/s sobre HTTPS** (TLS 1.3, keep-alive), 30 s, 0 errores (`SPEC.md` §11). Resultado obtenido con `bench/bench_proxy.sh`:

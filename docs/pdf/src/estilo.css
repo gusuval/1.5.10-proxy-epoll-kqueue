@@ -1,0 +1,80 @@
+/* Estilo de impresión común a los documentos PDF (A4). */
+@page { size: A4; }
+
+:root {
+  --ink: #1d2330;
+  --muted: #5b6475;
+  --rule: #d9dee7;
+  --accent: #0b6e69;
+  --accent-soft: #e6f2f1;
+  --warn: #9a5b00;
+  --warn-soft: #fff4e0;
+  --code-bg: #f4f6f9;
+}
+
+html { font-family: "Ubuntu Sans", "DejaVu Sans", sans-serif; font-size: 10pt; color: var(--ink); line-height: 1.5; }
+body { margin: 0; }
+
+/* ---------- portada ---------- */
+.cover { height: 247mm; display: flex; flex-direction: column; justify-content: space-between; page-break-after: always; }
+.cover .band { border-left: 6px solid var(--accent); padding: 4mm 0 4mm 8mm; margin-top: 45mm; }
+.cover .kicker { font-size: 10pt; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 600; }
+.cover h1 { font-size: 28pt; line-height: 1.15; margin: 4mm 0 3mm; border: 0; padding: 0; }
+.cover .sub { font-size: 13pt; color: var(--muted); max-width: 140mm; }
+.cover .meta { font-size: 9pt; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 4mm; display: grid; grid-template-columns: 30mm 1fr; row-gap: 1mm; }
+.cover .meta b { color: var(--ink); font-weight: 600; }
+
+/* ---------- índice ---------- */
+.toc { page-break-after: always; }
+.toc ol { padding-left: 0; list-style: none; counter-reset: t; }
+.toc > ol > li { counter-increment: t; margin: 2.2mm 0; font-weight: 600; }
+.toc > ol > li::before { content: counter(t) ". "; color: var(--accent); }
+.toc ol ol { font-weight: 400; margin: 1mm 0 0 6mm; color: var(--muted); font-size: 9pt; }
+.toc ol ol li { margin: .5mm 0; }
+
+/* ---------- títulos numerados ---------- */
+body { counter-reset: h2; }
+h2 { counter-increment: h2; counter-reset: h3; font-size: 16pt; margin: 0 0 4mm; padding-bottom: 2mm; border-bottom: 2px solid var(--accent); page-break-before: always; page-break-after: avoid; }
+h2::before { content: counter(h2) ". "; color: var(--accent); }
+h2.nonum { counter-increment: none; }
+h2.nonum::before { content: ""; }
+h3 { counter-increment: h3; font-size: 12pt; margin: 6mm 0 2mm; page-break-after: avoid; }
+h3::before { content: counter(h2) "." counter(h3) " "; color: var(--accent); }
+h4 { font-size: 10.5pt; margin: 4mm 0 1.5mm; page-break-after: avoid; }
+p { margin: 0 0 2.5mm; orphans: 3; widows: 3; }
+ul, ol { margin: 0 0 3mm; padding-left: 6mm; }
+li { margin: .8mm 0; }
+a { color: var(--accent); text-decoration: none; }
+strong { font-weight: 600; }
+
+/* ---------- código ---------- */
+code, pre, kbd { font-family: "Ubuntu Sans Mono", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: var(--code-bg); padding: .2mm 1mm; border-radius: 1mm; }
+pre { font-size: 8.4pt; line-height: 1.4; background: var(--code-bg); border: 1px solid var(--rule); border-radius: 1.5mm; padding: 3mm 3.5mm; margin: 0 0 3.5mm; white-space: pre-wrap; page-break-inside: avoid; }
+pre code { background: none; padding: 0; font-size: inherit; }
+.c { color: #6a7385; } /* comentario dentro de pre */
+
+/* ---------- tablas ---------- */
+table { width: 100%; border-collapse: collapse; margin: 0 0 4mm; font-size: 9pt; page-break-inside: avoid; }
+th { text-align: left; font-weight: 600; background: var(--accent-soft); border-bottom: 1.5px solid var(--accent); padding: 1.6mm 2mm; }
+td { border-bottom: 1px solid var(--rule); padding: 1.4mm 2mm; vertical-align: top; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td code { font-size: 8.4pt; }
+
+/* ---------- avisos ---------- */
+.note, .warn { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 2.5mm 4mm; margin: 0 0 4mm; border-radius: 0 1.5mm 1.5mm 0; page-break-inside: avoid; }
+.warn { border-color: var(--warn); background: var(--warn-soft); }
+.note > :last-child, .warn > :last-child { margin-bottom: 0; }
+
+/* ---------- figuras ---------- */
+figure { margin: 2mm 0 5mm; page-break-inside: avoid; text-align: center; }
+figure svg { max-width: 100%; height: auto; }
+figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 1.5mm; }
+
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3mm; margin: 0 0 5mm; page-break-inside: avoid; }
+.kpi { border: 1px solid var(--rule); border-top: 3px solid var(--accent); border-radius: 1.5mm; padding: 2.5mm 3mm; }
+.kpi .v { font-size: 16pt; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi .l { font-size: 8pt; color: var(--muted); }
+
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
+.avoid { page-break-inside: avoid; }
